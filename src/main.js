@@ -9,28 +9,20 @@ let currentMap = null;
 let currentTurnstileId = null;
 let me = null;
 
-
-/* =========================================================
-   HELPERS
-========================================================= */
-
-const esc = (v = '') =>
-  String(v).replace(/[&<>'"]/g, c => ({
-    '&': '&amp;',
-    '<': '&lt;',
-    '>': '&gt;',
-    "'": '&#39;',
-    '"': '&quot;'
-  }[c]));
-
+const esc = (v='') => String(v).replace(/[&<>'"]/g, c => ({
+  '&':'&amp;',
+  '<':'&lt;',
+  '>':'&gt;',
+  "'":'&#39;',
+  '"':'&quot;'
+}[c]));
 
 const fmtTime = ms => ms
-  ? new Intl.DateTimeFormat(undefined, {
-      dateStyle: 'medium',
-      timeStyle: 'short'
+  ? new Intl.DateTimeFormat(undefined,{
+      dateStyle:'medium',
+      timeStyle:'short'
     }).format(new Date(Number(ms)))
   : 'Never';
-
 
 const ago = ms => {
   if (!ms) return 'No sightings yet';
@@ -41,30 +33,28 @@ const ago = ms => {
   );
 
   if (s < 60) return `${s}s ago`;
-  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
-  if (s < 86400) return `${Math.floor(s / 3600)} hr ago`;
+  if (s < 3600) return `${Math.floor(s/60)} min ago`;
+  if (s < 86400) return `${Math.floor(s/3600)} hr ago`;
 
-  return `${Math.floor(s / 86400)} day ago`;
+  return `${Math.floor(s/86400)} day ago`;
 };
 
-
 const nice = v => ({
-  with_puppies: 'With puppies',
-  needs_help: 'Needs help',
-  afraid: 'Afraid',
-  seen: 'Seen',
-  safe: 'Safe',
-  injured: 'Injured',
-  hungry: 'Hungry'
+  with_puppies:'With puppies',
+  needs_help:'Needs help',
+  afraid:'Afraid',
+  seen:'Seen',
+  safe:'Safe',
+  injured:'Injured',
+  hungry:'Hungry'
 }[v] || v || 'Seen');
 
 
-/* =========================================================
-   GOOGLE MAPS NAVIGATION
-   No API key / Google Maps API billing required.
-========================================================= */
+/* =====================================================
+   LOCATION + GOOGLE MAPS
+===================================================== */
 
-function mapsDirectionsUrl(lat, lng) {
+function validLocation(lat, lng) {
   const latitude = Number(lat);
   const longitude = Number(lng);
 
@@ -76,78 +66,375 @@ function mapsDirectionsUrl(lat, lng) {
     longitude < -180 ||
     longitude > 180
   ) {
-    return '';
+    return null;
   }
 
-  return `https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(
-    `${latitude},${longitude}`
-  )}`;
+  return {
+    latitude,
+    longitude
+  };
 }
 
 
-function navigationButton(
-  lat,
-  lng,
-  label = '🧭 Navigate'
-) {
-  const url = mapsDirectionsUrl(lat, lng);
+function mapsDirectionsUrl(lat, lng) {
+  const p = validLocation(lat, lng);
 
-  if (!url) return '';
+  if (!p) return '';
+
+  const destination = encodeURIComponent(
+    `${p.latitude},${p.longitude}`
+  );
+
+  return (
+    'https://www.google.com/maps/dir/?api=1' +
+    `&destination=${destination}` +
+    '&travelmode=walking' +
+    '&dir_action=navigate'
+  );
+}
+
+
+function googleMapsAppUrl(lat, lng) {
+  const p = validLocation(lat, lng);
+
+  if (!p) return '';
+
+  const destination = encodeURIComponent(
+    `${p.latitude},${p.longitude}`
+  );
+
+  const fallback = encodeURIComponent(
+    'https://play.google.com/store/apps/details?id=com.google.android.apps.maps'
+  );
+
+  return (
+    'intent://www.google.com/maps/dir/' +
+    `?api=1&destination=${destination}` +
+    '&travelmode=walking' +
+    '&dir_action=navigate' +
+    '#Intent;' +
+    'scheme=https;' +
+    'package=com.google.android.apps.maps;' +
+    `S.browser_fallback_url=${fallback};` +
+    'end'
+  );
+}
+
+
+function navigationButtons(lat, lng) {
+  const normalUrl = mapsDirectionsUrl(lat, lng);
+  const appUrl = googleMapsAppUrl(lat, lng);
+
+  if (!normalUrl) return '';
 
   return `
-    <a
-      class="btn secondary"
-      href="${esc(url)}"
-      target="_blank"
-      rel="noopener noreferrer"
+    <div
+      style="
+        display:flex;
+        gap:8px;
+        flex-wrap:wrap;
+        align-items:center;
+      "
     >
-      ${esc(label)}
-    </a>
+
+      <a
+        class="btn secondary"
+        href="${esc(normalUrl)}"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        🗺️ Check on Google Maps
+      </a>
+
+      <a
+        class="btn"
+        href="${esc(appUrl)}"
+      >
+        ▶️ Start Navigation
+      </a>
+
+    </div>
   `;
 }
 
 
-/* =========================================================
-   API
-========================================================= */
+/*
+  BEST AVAILABLE GPS
 
-async function api(url, options = {}) {
+  Browser/phone GPS cannot promise 100% accuracy.
+
+  This collects multiple GPS readings,
+  keeps the best one,
+  aims for <= 20 meters,
+  and rejects worse than 50 meters.
+*/
+function getBestLocation({
+  targetAccuracyM = 20,
+  maxAcceptedAccuracyM = 50,
+  timeoutMs = 15000,
+  onUpdate = () => {}
+} = {}) {
+
+  return new Promise((resolve, reject) => {
+
+    if (!navigator.geolocation) {
+      reject(
+        new Error(
+          'Geolocation is not supported on this device.'
+        )
+      );
+
+      return;
+    }
+
+
+    let best = null;
+    let watchId = null;
+    let finished = false;
+
+
+    const finish = (error=null) => {
+
+      if (finished) return;
+
+      finished = true;
+
+
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(
+          watchId
+        );
+      }
+
+
+      clearTimeout(timer);
+
+
+      if (error) {
+        reject(error);
+        return;
+      }
+
+
+      if (!best) {
+        reject(
+          new Error(
+            'Could not get a location fix.'
+          )
+        );
+
+        return;
+      }
+
+
+      if (
+        best.accuracy >
+        maxAcceptedAccuracyM
+      ) {
+
+        reject(
+          new Error(
+            `GPS accuracy is only ±${Math.round(
+              best.accuracy
+            )}m. Move near a window/outdoors and retry.`
+          )
+        );
+
+        return;
+      }
+
+
+      resolve(best);
+    };
+
+
+    const timer = setTimeout(
+      () => finish(),
+      timeoutMs
+    );
+
+
+    watchId =
+      navigator.geolocation.watchPosition(
+
+        pos => {
+
+          const candidate = {
+
+            latitude:
+              pos.coords.latitude,
+
+            longitude:
+              pos.coords.longitude,
+
+            accuracy:
+              pos.coords.accuracy,
+
+            altitude:
+              pos.coords.altitude,
+
+            heading:
+              pos.coords.heading,
+
+            speed:
+              pos.coords.speed,
+
+            capturedAt:
+              Date.now()
+          };
+
+
+          if (
+            Number.isFinite(
+              candidate.latitude
+            ) &&
+            Number.isFinite(
+              candidate.longitude
+            ) &&
+            Number.isFinite(
+              candidate.accuracy
+            ) &&
+            (
+              !best ||
+              candidate.accuracy <
+              best.accuracy
+            )
+          ) {
+
+            best = candidate;
+
+            onUpdate(best);
+          }
+
+
+          if (
+            best &&
+            best.accuracy <=
+            targetAccuracyM
+          ) {
+
+            finish();
+          }
+
+        },
+
+
+        err => {
+
+          if (err.code === 1) {
+
+            finish(
+              new Error(
+                'Location permission was not allowed.'
+              )
+            );
+
+            return;
+          }
+
+
+          if (err.code === 2) {
+
+            finish(
+              new Error(
+                'Location is unavailable. Turn on GPS and retry.'
+              )
+            );
+
+            return;
+          }
+
+
+          if (err.code === 3) {
+
+            finish();
+
+            return;
+          }
+
+
+          finish(
+            new Error(
+              'Could not get a usable location.'
+            )
+          );
+
+        },
+
+
+        {
+          enableHighAccuracy:true,
+          timeout:10000,
+          maximumAge:0
+        }
+
+      );
+  });
+}
+
+
+/* =====================================================
+   API
+===================================================== */
+
+async function api(url, options={}) {
+
   const res = await fetch(url, {
-    credentials: 'same-origin',
+
+    credentials:'same-origin',
+
     ...options,
-    headers: {
-      'content-type': 'application/json',
+
+    headers:{
+      'content-type':'application/json',
       ...(options.headers || {})
     }
   });
 
-  const data = await res.json().catch(() => ({}));
+
+  const data =
+    await res.json().catch(() => ({}));
+
 
   if (!res.ok) {
+
     throw new Error(
-      data.error || `Request failed (${res.status})`
+      data.error ||
+      `Request failed (${res.status})`
     );
   }
+
 
   return data;
 }
 
 
-/* =========================================================
-   NAV / PAGE SHELL
-========================================================= */
+/* =====================================================
+   NAV
+===================================================== */
 
 function nav() {
+
   return `
     <nav class="nav">
+
       <div class="wrap navin">
 
-        <a class="brand" href="/" data-link>
-          <span class="brandmark">🐾</span>
+        <a
+          class="brand"
+          href="/"
+          data-link
+        >
+          <span class="brandmark">
+            🐾
+          </span>
+
           Doges
         </a>
 
+
         <div class="navlinks">
+
           <a
             class="linkbtn hide-sm"
             href="/"
@@ -156,6 +443,7 @@ function nav() {
             Street dogs
           </a>
 
+
           <a
             class="linkbtn"
             href="/admin"
@@ -163,124 +451,170 @@ function nav() {
           >
             Admin
           </a>
+
         </div>
 
       </div>
+
     </nav>
   `;
 }
 
 
 function footer() {
+
   return `
     <footer class="footer">
+
       <div class="wrap">
+
         Community street-dog safety network ·
         Sightings are community reports,
         not continuous GPS tracking.
+
       </div>
+
     </footer>
   `;
 }
 
 
 function shell(content) {
+
   app.innerHTML =
     nav() +
     content +
     footer();
+
 
   bindLinks();
 }
 
 
 function bindLinks() {
+
   document
     .querySelectorAll('[data-link]')
     .forEach(a => {
-      a.addEventListener('click', e => {
-        if (
-          e.metaKey ||
-          e.ctrlKey ||
-          e.shiftKey ||
-          e.altKey
-        ) {
-          return;
+
+      a.addEventListener(
+        'click',
+        e => {
+
+          if (
+            e.metaKey ||
+            e.ctrlKey ||
+            e.shiftKey ||
+            e.altKey
+          ) {
+            return;
+          }
+
+
+          e.preventDefault();
+
+
+          history.pushState(
+            {},
+            '',
+            a.getAttribute('href')
+          );
+
+
+          route();
         }
+      );
 
-        e.preventDefault();
-
-        history.pushState(
-          {},
-          '',
-          a.getAttribute('href')
-        );
-
-        route();
-      });
     });
 }
 
 
-/* =========================================================
+/* =====================================================
    MAP
-========================================================= */
+===================================================== */
 
 function clearMap() {
+
   if (currentMap) {
+
     currentMap.remove();
+
     currentMap = null;
   }
 }
 
 
-/* =========================================================
+/* =====================================================
    TURNSTILE
-========================================================= */
+===================================================== */
 
-function resetTurnstile(remove = true) {
+function resetTurnstile(remove=true) {
+
   if (
     window.turnstile &&
     currentTurnstileId !== null
   ) {
+
     try {
-      if (remove) {
-        window.turnstile.remove(
-          currentTurnstileId
-        );
-      } else {
-        window.turnstile.reset(
-          currentTurnstileId
-        );
-      }
+
+      remove
+
+        ? window.turnstile.remove(
+            currentTurnstileId
+          )
+
+        : window.turnstile.reset(
+            currentTurnstileId
+          );
+
     } catch {}
   }
 
+
   if (remove) {
+
     currentTurnstileId = null;
   }
 }
 
 
 function waitTurnstile() {
-  return new Promise((resolve, reject) => {
-    let n = 0;
 
-    const timer = setInterval(() => {
-      if (window.turnstile) {
-        clearInterval(timer);
-        resolve(window.turnstile);
-      } else if (++n > 100) {
-        clearInterval(timer);
+  return new Promise(
+    (resolve, reject) => {
 
-        reject(
-          new Error(
-            'Human verification failed to load'
-          )
-        );
-      }
-    }, 100);
-  });
+      let n = 0;
+
+
+      const timer = setInterval(
+        () => {
+
+          if (window.turnstile) {
+
+            clearInterval(timer);
+
+            resolve(
+              window.turnstile
+            );
+
+          } else if (++n > 100) {
+
+            clearInterval(timer);
+
+
+            reject(
+              new Error(
+                'Human verification failed to load'
+              )
+            );
+          }
+
+        },
+        100
+      );
+
+    }
+  );
 }
 
 
@@ -289,82 +623,119 @@ async function renderTurnstile(
   callback,
   action
 ) {
+
   resetTurnstile(true);
 
+
   if (!config.turnstileSiteKey) {
+
     el.innerHTML = `
       <div class="notice bad">
         Turnstile is not configured.
       </div>
     `;
+
     return;
   }
 
-  const ts = await waitTurnstile();
 
-  currentTurnstileId = ts.render(el, {
-    sitekey: config.turnstileSiteKey,
-    theme: 'light',
-    action,
-    callback,
+  const ts =
+    await waitTurnstile();
 
-    'expired-callback': () =>
-      callback(''),
 
-    'error-callback': () =>
-      callback('')
-  });
+  currentTurnstileId =
+    ts.render(
+      el,
+      {
+
+        sitekey:
+          config.turnstileSiteKey,
+
+        theme:
+          'light',
+
+        action,
+
+        callback,
+
+        'expired-callback':
+          () => callback(''),
+
+        'error-callback':
+          () => callback('')
+      }
+    );
 }
 
 
-/* =========================================================
+/* =====================================================
    HOME
-========================================================= */
+===================================================== */
 
 async function home() {
+
   clearMap();
+
   resetTurnstile(true);
+
   me = null;
+
 
   shell(`
     <main>
 
       <section class="hero">
+
         <div class="wrap">
 
           <span class="badge">
             Community-powered street dog safety
           </span>
 
+
           <h1>
             See them. Help them.
             Keep their trail safe.
           </h1>
 
+
           <p>
+
             Each dog gets one permanent QR.
-            A scan can add a consent-based sighting,
-            condition and note.
+
+            A scan can add a consent-based
+            sighting, condition and note.
+
             Accepted sightings build a useful
             location history.
+
           </p>
 
         </div>
+
       </section>
 
 
       <section class="section">
+
         <div class="wrap">
+
 
           <div class="sectionhead">
 
             <div>
-              <h2>Street dogs</h2>
+
+              <h2>
+                Street dogs
+              </h2>
+
 
               <div class="muted">
                 Latest community records
               </div>
+
             </div>
+
 
             <input
               id="search"
@@ -376,13 +747,20 @@ async function home() {
           </div>
 
 
-          <div id="dogs" class="grid">
+          <div
+            id="dogs"
+            class="grid"
+          >
+
             <div class="card empty">
               Loading…
             </div>
+
           </div>
 
+
         </div>
+
       </section>
 
     </main>
@@ -390,110 +768,151 @@ async function home() {
 
 
   try {
+
     const { dogs } =
-      await api('/api/public/dogs');
+      await api(
+        '/api/public/dogs'
+      );
+
 
     const box =
-      document.querySelector('#dogs');
+      document.querySelector(
+        '#dogs'
+      );
+
 
     const search =
-      document.querySelector('#search');
+      document.querySelector(
+        '#search'
+      );
 
 
-    const draw = (q = '') => {
-      const filtered =
-        dogs.filter(d =>
-          `${d.name} ${d.area} ${d.color}`
-            .toLowerCase()
-            .includes(q.toLowerCase())
-        );
+    const draw =
+      (q='') => {
 
 
-      box.innerHTML =
-        filtered.length
+        const filtered =
+          dogs.filter(
+            d =>
 
-          ? filtered.map(d => `
-              <article class="card dogcard">
+              `${d.name} ${d.area} ${d.color}`
 
-                ${
-                  d.photo_data
-                    ? `
-                        <img
-                          class="dogphoto"
-                          src="${d.photo_data}"
-                          alt="${esc(d.name)}"
-                        >
-                      `
-                    : `
-                        <div class="dogphoto placeholder">
-                          🐕
-                        </div>
-                      `
-                }
+              .toLowerCase()
+
+              .includes(
+                q.toLowerCase()
+              )
+          );
 
 
-                <div>
-                  <div class="dogname">
-                    ${esc(d.name)}
-                  </div>
+        box.innerHTML =
 
-                  <div class="muted">
-                    ${esc(
-                      d.area ||
-                      'Area not set'
-                    )}
-                  </div>
+          filtered.length
+
+            ? filtered.map(
+                d => `
+
+                  <article class="card dogcard">
+
+
+                    <div class="dogphoto placeholder">
+                      🐕
+                    </div>
+
+
+                    <div>
+
+                      <div class="dogname">
+                        ${esc(d.name)}
+                      </div>
+
+
+                      <div class="muted">
+
+                        ${esc(
+                          d.area ||
+                          'Area not set'
+                        )}
+
+                      </div>
+
+                    </div>
+
+
+                    <div class="meta">
+
+
+                      <span class="pill">
+                        ${esc(d.sex)}
+                      </span>
+
+
+                      <span class="pill">
+
+                        Vaccinated:
+
+                        ${esc(
+                          d.vaccination_status
+                        )}
+
+                      </span>
+
+
+                      <span class="pill">
+
+                        Sterilized:
+
+                        ${esc(
+                          d.sterilized_status
+                        )}
+
+                      </span>
+
+
+                    </div>
+
+
+                    <div class="muted">
+
+                      ${
+                        d.last_seen_at
+
+                          ? `Last seen ${ago(
+                              d.last_seen_at
+                            )}`
+
+                          : 'No accepted sighting yet'
+                      }
+
+                    </div>
+
+
+                    <a
+                      class="btn"
+                      href="/dog/${encodeURIComponent(
+                        d.id
+                      )}"
+                      data-link
+                    >
+                      View profile
+                    </a>
+
+
+                  </article>
+
+                `
+              ).join('')
+
+
+            : `
+                <div class="card empty">
+                  No matching dogs.
                 </div>
+              `;
 
 
-                <div class="meta">
-
-                  <span class="pill">
-                    ${esc(d.sex)}
-                  </span>
-
-                  <span class="pill">
-                    Vaccinated:
-                    ${esc(d.vaccination_status)}
-                  </span>
-
-                  <span class="pill">
-                    Sterilized:
-                    ${esc(d.sterilized_status)}
-                  </span>
-
-                </div>
-
-
-                <div class="muted">
-                  ${
-                    d.last_seen_at
-                      ? `Last seen ${ago(d.last_seen_at)}`
-                      : 'No accepted sighting yet'
-                  }
-                </div>
-
-
-                <a
-                  class="btn"
-                  href="/dog/${encodeURIComponent(d.id)}"
-                  data-link
-                >
-                  View profile
-                </a>
-
-              </article>
-            `).join('')
-
-          : `
-              <div class="card empty">
-                No matching dogs.
-              </div>
-            `;
-
-
-      bindLinks();
-    };
+        bindLinks();
+      };
 
 
     draw();
@@ -501,27 +920,40 @@ async function home() {
 
     search.addEventListener(
       'input',
-      () => draw(search.value)
+
+      () =>
+        draw(
+          search.value
+        )
     );
 
+
   } catch (e) {
-    document.querySelector('#dogs')
+
+    document
+      .querySelector('#dogs')
       .innerHTML = `
+
         <div class="card empty">
           ${esc(e.message)}
         </div>
+
       `;
   }
 }
 
 
-/* =========================================================
-   DOG LOCATION MAP
-========================================================= */
+/* =====================================================
+   DOG MAP
+===================================================== */
 
 function dogMap(sightings) {
+
   const el =
-    document.querySelector('#map');
+    document.querySelector(
+      '#map'
+    );
+
 
   if (
     !el ||
@@ -531,51 +963,59 @@ function dogMap(sightings) {
   }
 
 
-  currentMap = L.map(
-    el,
-    {
-      scrollWheelZoom: false
-    }
-  );
+  currentMap =
+    L.map(
+      el,
+      {
+        scrollWheelZoom:false
+      }
+    );
 
 
   L.tileLayer(
+
     'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
+
     {
-      maxZoom: 19,
+
+      maxZoom:19,
 
       attribution:
         '&copy; OpenStreetMap contributors'
+
     }
-  ).addTo(currentMap);
+
+  ).addTo(
+    currentMap
+  );
 
 
   const chronological =
     [...sightings].reverse();
+
 
   const coords = [];
 
 
   chronological.forEach(
     (s, i) => {
-      const latitude =
-        Number(s.latitude);
-
-      const longitude =
-        Number(s.longitude);
 
 
-      if (
-        !Number.isFinite(latitude) ||
-        !Number.isFinite(longitude)
-      ) {
+      const p =
+        validLocation(
+          s.latitude,
+          s.longitude
+        );
+
+
+      if (!p) {
         return;
       }
 
 
       const ll = [
-        latitude,
-        longitude
+        p.latitude,
+        p.longitude
       ];
 
 
@@ -587,37 +1027,48 @@ function dogMap(sightings) {
         chronological.length - 1;
 
 
-      const directions =
-        mapsDirectionsUrl(
-          latitude,
-          longitude
-        );
-
-
       const popup = `
-        <div style="min-width:185px">
+
+        <div style="min-width:210px">
+
 
           <strong>
+
             ${
               latest
+
                 ? 'Latest sighting'
-                : esc(fmtTime(s.created_at))
+
+                : esc(
+                    fmtTime(
+                      s.created_at
+                    )
+                  )
             }
+
           </strong>
 
 
           <div style="margin-top:5px">
-            ${esc(nice(s.condition))}
+
+            ${esc(
+              nice(
+                s.condition
+              )
+            )}
+
           </div>
 
 
           ${
             s.note
+
               ? `
                   <div style="margin-top:5px">
                     📝 ${esc(s.note)}
                   </div>
                 `
+
               : ''
           }
 
@@ -629,35 +1080,25 @@ function dogMap(sightings) {
               opacity:.75
             "
           >
+
             GPS ±${Math.round(
-              Number(s.accuracy_m) || 0
+              Number(
+                s.accuracy_m
+              ) || 0
             )}m
+
           </div>
 
 
-          ${
-            directions
-              ? `
-                  <a
-                    href="${esc(directions)}"
-                    target="_blank"
-                    rel="noopener noreferrer"
-                    style="
-                      display:inline-block;
-                      margin-top:10px;
-                      padding:9px 13px;
-                      border-radius:9px;
-                      background:#1f7a4d;
-                      color:#fff;
-                      text-decoration:none;
-                      font-weight:700;
-                    "
-                  >
-                    🧭 Navigate
-                  </a>
-                `
-              : ''
-          }
+          <div style="margin-top:10px">
+
+            ${navigationButtons(
+              p.latitude,
+              p.longitude
+            )}
+
+          </div>
+
 
         </div>
       `;
@@ -666,62 +1107,95 @@ function dogMap(sightings) {
       L.circleMarker(
         ll,
         {
+
           radius:
             latest
               ? 10
               : 6,
 
-          weight: 3,
-          fillOpacity: .8
+          weight:3,
+
+          fillOpacity:.8
         }
       )
-      .addTo(currentMap)
-      .bindPopup(popup);
+
+      .addTo(
+        currentMap
+      )
+
+      .bindPopup(
+        popup
+      );
 
     }
   );
 
 
   if (!coords.length) {
+
     currentMap.remove();
+
     currentMap = null;
+
     return;
   }
 
 
-  if (coords.length > 1) {
+  if (
+    coords.length > 1
+  ) {
+
     L.polyline(
       coords,
       {
-        weight: 3,
-        opacity: .6,
-        dashArray: '7 7'
+
+        weight:3,
+
+        opacity:.6,
+
+        dashArray:
+          '7 7'
       }
-    ).addTo(currentMap);
+    )
+
+    .addTo(
+      currentMap
+    );
   }
 
 
   currentMap.fitBounds(
-    L.latLngBounds(coords),
+
+    L.latLngBounds(
+      coords
+    ),
+
     {
-      padding: [35, 35],
-      maxZoom: 16
+
+      padding:
+        [35,35],
+
+      maxZoom:
+        16
     }
   );
 }
 
 
-/* =========================================================
-   DOG PUBLIC PROFILE
-========================================================= */
+/* =====================================================
+   DOG PROFILE
+===================================================== */
 
 async function dogPage(id) {
+
   clearMap();
+
   resetTurnstile(true);
 
 
   shell(`
     <main>
+
       <div class="wrap section">
 
         <div class="card empty">
@@ -729,17 +1203,24 @@ async function dogPage(id) {
         </div>
 
       </div>
+
     </main>
   `);
 
 
   try {
+
     const {
       dog,
       sightings
     } =
+
       await api(
-        `/api/public/dog/${encodeURIComponent(id)}`
+
+        `/api/public/dog/${encodeURIComponent(
+          id
+        )}`
+
       );
 
 
@@ -748,46 +1229,66 @@ async function dogPage(id) {
 
 
     const timeline =
+
       sightings.length
 
         ? sightings.map(
-            (s, i) => `
+            (s,i) => `
+
               <div class="sighting">
+
 
                 <div class="dotcol">
 
+
                   <div class="dot"></div>
 
+
                   ${
-                    i < sightings.length - 1
+                    i <
+                    sightings.length - 1
+
                       ? '<div class="line"></div>'
+
                       : ''
                   }
+
 
                 </div>
 
 
                 <div class="sightingbody">
 
+
                   <strong>
+
                     ${
                       i === 0
                         ? 'Latest · '
                         : ''
                     }
 
-                    ${esc(nice(s.condition))}
+                    ${esc(
+                      nice(
+                        s.condition
+                      )
+                    )}
+
                   </strong>
 
 
                   <span class="muted">
 
                     ${esc(
-                      fmtTime(s.created_at)
+                      fmtTime(
+                        s.created_at
+                      )
                     )}
 
                     · GPS ±${Math.round(
-                      Number(s.accuracy_m) || 0
+                      Number(
+                        s.accuracy_m
+                      ) || 0
                     )}m
 
                   </span>
@@ -798,78 +1299,100 @@ async function dogPage(id) {
                       s.confidence
                     )}"
                   >
+
                     ${esc(
-                      String(s.confidence)
-                        .toUpperCase()
+                      String(
+                        s.confidence
+                      ).toUpperCase()
                     )}
 
                     CONFIDENCE
+
                   </div>
 
 
                   ${
                     s.note
+
                       ? `
                           <div style="margin-top:5px">
                             📝 ${esc(s.note)}
                           </div>
                         `
+
                       : ''
                   }
 
 
                   <div style="margin-top:10px">
 
-                    ${navigationButton(
+                    ${navigationButtons(
                       s.latitude,
-                      s.longitude,
-                      i === 0
-                        ? '🧭 Navigate to latest sighting'
-                        : '🧭 Navigate'
+                      s.longitude
                     )}
 
                   </div>
 
+
                 </div>
 
+
               </div>
+
             `
           ).join('')
 
+
         : `
+
             <div class="notice">
+
               No accepted sightings yet.
+
               The first public report is held
               for admin review.
+
             </div>
+
           `;
 
 
     shell(`
       <main>
+
         <div class="wrap">
 
 
           <section class="profilehead">
 
+
             ${
               dog.photo_data
+
                 ? `
+
                     <img
                       class="dogphoto"
                       src="${dog.photo_data}"
-                      alt="${esc(dog.name)}"
+                      alt="${esc(
+                        dog.name
+                      )}"
                     >
+
                   `
+
                 : `
+
                     <div class="dogphoto placeholder">
                       🐕
                     </div>
+
                   `
             }
 
 
             <div>
+
 
               <span class="badge">
                 Permanent dog profile
@@ -903,41 +1426,58 @@ async function dogPage(id) {
                 style="margin-top:12px"
               >
 
+
                 <span class="pill">
                   ${esc(dog.sex)}
                 </span>
 
 
                 <span class="pill">
+
                   Vaccinated:
+
                   ${esc(
                     dog.vaccination_status
                   )}
+
                 </span>
 
 
                 <span class="pill">
+
                   Sterilized:
+
                   ${esc(
                     dog.sterilized_status
                   )}
+
                 </span>
+
 
               </div>
 
 
               ${
                 dog.description
+
                   ? `
+
                       <p style="line-height:1.6">
-                        ${esc(dog.description)}
+
+                        ${esc(
+                          dog.description
+                        )}
+
                       </p>
+
                     `
+
                   : ''
               }
 
 
               <div class="profileactions">
+
 
                 <button
                   class="btn"
@@ -947,17 +1487,6 @@ async function dogPage(id) {
                 </button>
 
 
-                ${
-                  latest
-                    ? navigationButton(
-                        latest.latitude,
-                        latest.longitude,
-                        '🧭 Navigate to Last Seen'
-                      )
-                    : ''
-                }
-
-
                 <button
                   class="btn secondary"
                   id="shareProfile"
@@ -965,18 +1494,24 @@ async function dogPage(id) {
                   Share profile
                 </button>
 
+
               </div>
 
+
             </div>
+
 
           </section>
 
 
           <section class="section">
 
+
             <div class="latest">
 
+
               <div class="card">
+
 
                 <div class="muted">
                   Latest accepted sighting
@@ -984,21 +1519,31 @@ async function dogPage(id) {
 
 
                 <div class="metric">
+
                   ${
                     latest
-                      ? ago(latest.created_at)
+
+                      ? ago(
+                          latest.created_at
+                        )
+
                       : 'None yet'
                   }
+
                 </div>
 
 
                 ${
                   latest
+
                     ? `
+
                         <div style="margin-top:8px">
 
                           ${esc(
-                            nice(latest.condition)
+                            nice(
+                              latest.condition
+                            )
                           )}
 
                           ·
@@ -1008,9 +1553,11 @@ async function dogPage(id) {
                               latest.confidence
                             )}"
                           >
+
                             ${esc(
                               latest.confidence
                             )}
+
                           </span>
 
                         </div>
@@ -1018,32 +1565,41 @@ async function dogPage(id) {
 
                         ${
                           latest.note
+
                             ? `
+
                                 <div style="margin-top:8px">
-                                  📝 ${esc(latest.note)}
+                                  📝 ${esc(
+                                    latest.note
+                                  )}
                                 </div>
+
                               `
+
                             : ''
                         }
 
 
-                        <div style="margin-top:12px">
+                        <div style="margin-top:14px">
 
-                          ${navigationButton(
+                          ${navigationButtons(
                             latest.latitude,
-                            latest.longitude,
-                            '🧭 Get directions'
+                            latest.longitude
                           )}
 
                         </div>
+
                       `
+
                     : ''
                 }
+
 
               </div>
 
 
               <div class="card">
+
 
                 <div class="muted">
                   History entries
@@ -1059,21 +1615,29 @@ async function dogPage(id) {
                   style="margin-top:8px"
                   class="muted"
                 >
+
                   Only accepted reports are public
+
                 </div>
+
 
               </div>
 
+
             </div>
+
 
           </section>
 
 
           <section class="section">
 
+
             <div class="sectionhead">
 
+
               <div>
+
 
                 <h2>
                   Location history
@@ -1081,41 +1645,58 @@ async function dogPage(id) {
 
 
                 <div class="muted">
-                  Tap a marker for sighting details
-                  and navigation.
+
+                  Tap a marker to check Google Maps
+                  or start navigation.
+
                   Newest accepted sighting is
                   the current Last Seen.
+
                 </div>
 
+
               </div>
+
 
             </div>
 
 
             ${
               sightings.length
+
                 ? `
+
                     <div
                       id="map"
                       class="map"
                     ></div>
+
                   `
+
                 : `
+
                     <div class="card empty">
+
                       Map appears after an admin
                       accepts the first sighting.
+
                     </div>
+
                   `
             }
+
 
           </section>
 
 
           <section class="section">
 
+
             <div class="sectionhead">
 
+
               <div>
+
 
                 <h2>
                   Sighting timeline
@@ -1123,67 +1704,99 @@ async function dogPage(id) {
 
 
                 <div class="muted">
-                  Up to 50 recent accepted sightings ·
-                  every location has directions
+                  Up to 50 recent accepted sightings
                 </div>
 
+
               </div>
+
 
             </div>
 
 
             <div class="card timeline">
+
               ${timeline}
+
             </div>
+
 
           </section>
 
 
         </div>
+
       </main>
     `);
 
 
-    if (sightings.length) {
-      dogMap(sightings);
+    if (
+      sightings.length
+    ) {
+
+      dogMap(
+        sightings
+      );
     }
 
 
     document
-      .querySelector('#shareSighting')
+      .querySelector(
+        '#shareSighting'
+      )
       .addEventListener(
+
         'click',
+
         () =>
-          openSightingModal(dog)
+          openSightingModal(
+            dog
+          )
       );
 
 
     document
-      .querySelector('#shareProfile')
+      .querySelector(
+        '#shareProfile'
+      )
       .addEventListener(
+
         'click',
+
         async () => {
+
           try {
-            if (navigator.share) {
+
+            if (
+              navigator.share
+            ) {
+
               await navigator.share({
+
                 title:
                   `${dog.name} — Doges`,
 
                 url:
                   location.href
               });
+
             } else {
+
               alert(
                 'Copy this page URL from your browser to share it.'
               );
             }
+
           } catch {}
         }
       );
 
+
   } catch (e) {
+
     shell(`
       <main>
+
         <div class="wrap section">
 
           <div class="card empty">
@@ -1191,45 +1804,56 @@ async function dogPage(id) {
           </div>
 
         </div>
+
       </main>
     `);
   }
 }
 
 
-/* =========================================================
+/* =====================================================
    MODAL
-========================================================= */
+===================================================== */
 
 function modal(html) {
+
   const back =
-    document.createElement('div');
+    document.createElement(
+      'div'
+    );
 
 
   back.className =
     'modalback';
 
 
-  back.innerHTML = `
-    <div class="modal">
-      ${html}
-    </div>
-  `;
+  back.innerHTML =
+    `<div class="modal">${html}</div>`;
 
 
-  document.body.appendChild(back);
+  document.body.appendChild(
+    back
+  );
 
 
   const close = () => {
+
     resetTurnstile(true);
+
     back.remove();
   };
 
 
   back.addEventListener(
+
     'click',
+
     e => {
-      if (e.target === back) {
+
+      if (
+        e.target === back
+      ) {
+
         close();
       }
     }
@@ -1237,7 +1861,9 @@ function modal(html) {
 
 
   back
-    .querySelector('[data-close]')
+    .querySelector(
+      '[data-close]'
+    )
     ?.addEventListener(
       'click',
       close
@@ -1251,264 +1877,380 @@ function modal(html) {
 }
 
 
-/* =========================================================
+/* =====================================================
    SHARE SIGHTING
-========================================================= */
+===================================================== */
 
 async function openSightingModal(dog) {
+
   let gps = null;
   let token = '';
+  let locating = false;
 
 
-  const m = modal(`
-    <div class="modalhead">
+  const m =
+    modal(`
 
-      <div>
-
-        <h2>
-          Share a sighting
-        </h2>
+      <div class="modalhead">
 
 
-        <div class="muted">
-          ${esc(dog.name)}
-          · location is shared only
-          after Submit
+        <div>
+
+
+          <h2>
+            Share a sighting
+          </h2>
+
+
+          <div class="muted">
+
+            ${esc(dog.name)}
+
+            · location is shared
+            only after Submit
+
+          </div>
+
+
         </div>
+
+
+        <button
+          class="iconbtn"
+          data-close
+          aria-label="Close"
+        >
+          ×
+        </button>
+
 
       </div>
 
 
-      <button
-        class="iconbtn"
-        data-close
-        aria-label="Close"
+      <div class="notice">
+
+        For better location accuracy,
+        turn on phone GPS and stand
+        near a window or outdoors.
+
+        Doges keeps the best GPS fix
+        received from your phone.
+
+      </div>
+
+
+      <div
+        class="formgrid"
+        style="margin-top:14px"
       >
-        ×
-      </button>
-
-    </div>
 
 
-    <div class="notice">
-      A report is a community sighting,
-      not proof of physical presence.
-      Suspicious reports are held for review.
-    </div>
+        <div class="field full">
 
 
-    <div
-      class="formgrid"
-      style="margin-top:14px"
-    >
-
-      <div class="field full">
-
-        <button
-          class="btn secondary"
-          id="getGps"
-        >
-          📍 Get my current location
-        </button>
+          <button
+            class="btn secondary"
+            id="getGps"
+          >
+            🎯 Get precise location
+          </button>
 
 
-        <div
-          id="gpsState"
-          class="hint"
-        >
-          Location not requested yet.
-        </div>
+          <div
+            id="gpsState"
+            class="hint"
+          >
+            Location not requested yet.
+          </div>
 
-      </div>
-
-
-      <div class="field full">
-
-        <label>
-          Condition
-        </label>
-
-
-        <div class="conditionrow">
-
-          ${
-            [
-              'seen',
-              'safe',
-              'injured',
-              'hungry',
-              'with_puppies',
-              'afraid',
-              'needs_help'
-            ]
-            .map(
-              (x, i) => `
-                <input
-                  type="radio"
-                  name="condition"
-                  value="${x}"
-                  id="c${i}"
-                  ${i === 0 ? 'checked' : ''}
-                >
-
-                <label for="c${i}">
-                  ${nice(x)}
-                </label>
-              `
-            )
-            .join('')
-          }
 
         </div>
 
-      </div>
+
+        <div class="field full">
 
 
-      <div class="field full">
-
-        <label for="note">
-          Note
-          <span class="muted">
-            (optional)
-          </span>
-        </label>
+          <label>
+            Condition
+          </label>
 
 
-        <textarea
-          id="note"
-          maxlength="250"
-          placeholder="e.g. Sitting near Gate 2, looks injured…"
-        ></textarea>
+          <div class="conditionrow">
 
 
-        <div class="hint">
-          Maximum 250 characters.
-          Please avoid personal information.
+            ${
+              [
+                'seen',
+                'safe',
+                'injured',
+                'hungry',
+                'with_puppies',
+                'afraid',
+                'needs_help'
+              ]
+
+              .map(
+                (x,i) => `
+
+                  <input
+                    type="radio"
+                    name="condition"
+                    value="${x}"
+                    id="c${i}"
+                    ${
+                      i === 0
+                        ? 'checked'
+                        : ''
+                    }
+                  >
+
+
+                  <label for="c${i}">
+                    ${nice(x)}
+                  </label>
+
+                `
+              )
+
+              .join('')
+            }
+
+
+          </div>
+
+
         </div>
 
+
+        <div class="field full">
+
+
+          <label for="note">
+
+            Note
+
+            <span class="muted">
+              (optional)
+            </span>
+
+          </label>
+
+
+          <textarea
+            id="note"
+            maxlength="250"
+            placeholder="e.g. Sitting near Gate 2, looks injured…"
+          ></textarea>
+
+
+          <div class="hint">
+
+            Maximum 250 characters.
+
+            Please avoid personal information.
+
+          </div>
+
+
+        </div>
+
+
+        <div class="field full">
+
+          <div
+            id="sightingTs"
+            class="turnstile-slot"
+          ></div>
+
+        </div>
+
+
+        <div class="field full">
+
+
+          <button
+            class="btn"
+            id="submitSighting"
+            disabled
+          >
+            Submit sighting
+          </button>
+
+
+          <div id="sightingMsg"></div>
+
+
+        </div>
+
+
       </div>
-
-
-      <div class="field full">
-
-        <div
-          id="sightingTs"
-          class="turnstile-slot"
-        ></div>
-
-      </div>
-
-
-      <div class="field full">
-
-        <button
-          class="btn"
-          id="submitSighting"
-          disabled
-        >
-          Submit sighting
-        </button>
-
-
-        <div id="sightingMsg"></div>
-
-      </div>
-
-    </div>
-  `);
+    `);
 
 
   const gpsBtn =
-    m.back.querySelector('#getGps');
+    m.back.querySelector(
+      '#getGps'
+    );
+
 
   const state =
-    m.back.querySelector('#gpsState');
+    m.back.querySelector(
+      '#gpsState'
+    );
+
 
   const submit =
-    m.back.querySelector('#submitSighting');
+    m.back.querySelector(
+      '#submitSighting'
+    );
+
 
   const msg =
-    m.back.querySelector('#sightingMsg');
+    m.back.querySelector(
+      '#sightingMsg'
+    );
+
+
+  const updateSubmit =
+    () => {
+
+      submit.disabled =
+        !(token && gps) ||
+        locating;
+    };
 
 
   gpsBtn.addEventListener(
+
     'click',
-    () => {
+
+    async () => {
+
+
+      if (locating) {
+        return;
+      }
+
+
+      locating = true;
+
+      gps = null;
+
+
+      gpsBtn.disabled =
+        true;
+
+
       state.textContent =
-        'Requesting location permission…';
+        'Getting GPS fixes… keep phone still for a few seconds.';
 
 
-      navigator.geolocation
-        .getCurrentPosition(
-
-          pos => {
-            gps = {
-              latitude:
-                pos.coords.latitude,
-
-              longitude:
-                pos.coords.longitude,
-
-              accuracy:
-                pos.coords.accuracy
-            };
+      updateSubmit();
 
 
-            state.textContent =
-              `Location ready · accuracy about ±${Math.round(
-                gps.accuracy
-              )}m`;
+      try {
+
+        const best =
+          await getBestLocation({
+
+            targetAccuracyM:20,
+
+            maxAcceptedAccuracyM:50,
+
+            timeoutMs:15000,
 
 
-            submit.disabled =
-              !(token && gps);
-          },
+            onUpdate:
+              fix => {
+
+                state.textContent =
+
+                  `Best GPS so far: ±${Math.round(
+                    fix.accuracy
+                  )}m · improving…`;
+              }
+
+          });
 
 
-          err => {
-            state.textContent =
-              err.code === 1
-
-                ? 'Location permission was not allowed.'
-
-                : 'Could not get a usable location.';
-          },
+        gps = best;
 
 
-          {
-            enableHighAccuracy: true,
-            timeout: 12000,
-            maximumAge: 0
-          }
+        state.innerHTML =
 
-        );
+          `<strong>Location ready</strong> · GPS accuracy ±${Math.round(
+            gps.accuracy
+          )}m`;
+
+
+      } catch (err) {
+
+        gps = null;
+
+        state.textContent =
+          err.message;
+
+
+      } finally {
+
+        locating = false;
+
+
+        gpsBtn.disabled =
+          false;
+
+
+        gpsBtn.textContent =
+          gps
+
+            ? '🎯 Improve location again'
+
+            : '🎯 Retry precise location';
+
+
+        updateSubmit();
+      }
+
     }
   );
 
 
   await renderTurnstile(
-    m.back.querySelector('#sightingTs'),
+
+    m.back.querySelector(
+      '#sightingTs'
+    ),
+
 
     t => {
+
       token = t;
 
-      submit.disabled =
-        !(token && gps);
+      updateSubmit();
     },
+
 
     'sighting'
   );
 
 
   submit.addEventListener(
+
     'click',
+
     async () => {
-      if (!gps || !token) {
+
+
+      if (
+        !gps ||
+        !token
+      ) {
         return;
       }
 
 
-      submit.disabled = true;
+      submit.disabled =
+        true;
 
 
       msg.innerHTML = `
@@ -1519,104 +2261,148 @@ async function openSightingModal(dog) {
 
 
       try {
+
         const condition =
+
           m.back
             .querySelector(
               'input[name="condition"]:checked'
             )
             ?.value ||
+
           'seen';
 
 
         const result =
           await api(
+
             '/api/sighting',
+
             {
-              method: 'POST',
+
+              method:'POST',
+
 
               body:
                 JSON.stringify({
+
                   dogId:
                     dog.id,
 
-                  ...gps,
+                  latitude:
+                    gps.latitude,
+
+                  longitude:
+                    gps.longitude,
+
+                  accuracy:
+                    gps.accuracy,
 
                   condition,
 
+
                   note:
                     m.back
-                      .querySelector('#note')
+                      .querySelector(
+                        '#note'
+                      )
                       .value,
+
 
                   turnstileToken:
                     token
+
                 })
+
             }
+
           );
 
 
         msg.innerHTML =
-          result.sighting.moderationStatus ===
-          'accepted'
+
+          result.sighting
+            .moderationStatus ===
+            'accepted'
 
             ? `
+
                 <div class="notice good">
+
                   Sighting accepted.
+
                   Thank you for helping 🐾
+
                 </div>
+
               `
 
             : `
+
                 <div class="notice warn">
+
                   Report received and held
                   for admin review.
+
                   It will not replace
                   public Last Seen yet.
+
                 </div>
+
               `;
 
 
         setTimeout(
           () => {
+
             m.close();
 
             dogPage(
               dog.id
             );
+
           },
           1100
         );
 
+
       } catch (e) {
+
         msg.innerHTML = `
+
           <div class="notice bad">
             ${esc(e.message)}
           </div>
+
         `;
 
 
         token = '';
 
-        submit.disabled = true;
 
+        resetTurnstile(
+          false
+        );
 
-        resetTurnstile(false);
 
       } finally {
-        submit.disabled =
-          !(token && gps);
+
+        updateSubmit();
       }
+
     }
   );
 }
 
 
-/* =========================================================
+/* =====================================================
    ADMIN
-========================================================= */
+===================================================== */
 
 async function admin() {
+
   clearMap();
+
   resetTurnstile(true);
 
 
@@ -1640,6 +2426,7 @@ async function admin() {
 
 
   try {
+
     const result =
       await api(
         '/api/admin/me'
@@ -1652,19 +2439,23 @@ async function admin() {
 
     return adminDashboard();
 
+
   } catch {
+
     me = null;
+
 
     return adminLogin();
   }
 }
 
 
-/* =========================================================
+/* =====================================================
    ADMIN LOGIN
-========================================================= */
+===================================================== */
 
 async function adminLogin() {
+
   resetTurnstile(true);
 
 
@@ -1676,7 +2467,9 @@ async function adminLogin() {
         style="max-width:560px"
       >
 
+
         <div class="card">
+
 
           <span class="badge">
             Protected administration
@@ -1689,9 +2482,13 @@ async function adminLogin() {
 
 
           <p class="muted">
+
             Multiple admins are supported.
+
             Password hashes are stored in D1;
+
             the browser never receives them.
+
           </p>
 
 
@@ -1700,12 +2497,12 @@ async function adminLogin() {
             class="formgrid"
           >
 
+
             <div class="field full">
 
               <label>
                 Username
               </label>
-
 
               <input
                 id="username"
@@ -1721,7 +2518,6 @@ async function adminLogin() {
               <label>
                 Password
               </label>
-
 
               <input
                 id="password"
@@ -1759,9 +2555,12 @@ async function adminLogin() {
 
             </div>
 
+
           </form>
 
+
         </div>
+
 
       </div>
 
@@ -1773,31 +2572,48 @@ async function adminLogin() {
 
 
   const btn =
-    document.querySelector('#loginBtn');
+    document.querySelector(
+      '#loginBtn'
+    );
+
 
   const message =
-    document.querySelector('#loginMsg');
+    document.querySelector(
+      '#loginMsg'
+    );
 
 
   await renderTurnstile(
-    document.querySelector('#loginTs'),
+
+    document.querySelector(
+      '#loginTs'
+    ),
+
 
     t => {
+
       token = t;
 
       btn.disabled =
         !token;
     },
 
+
     'admin_login'
   );
 
 
   document
-    .querySelector('#loginForm')
+    .querySelector(
+      '#loginForm'
+    )
     .addEventListener(
+
       'submit',
+
       async e => {
+
+
         e.preventDefault();
 
 
@@ -1806,7 +2622,8 @@ async function adminLogin() {
         }
 
 
-        btn.disabled = true;
+        btn.disabled =
+          true;
 
 
         message.innerHTML = `
@@ -1817,29 +2634,44 @@ async function adminLogin() {
 
 
         try {
+
           const result =
             await api(
+
               '/api/admin/login',
+
               {
-                method: 'POST',
+
+                method:'POST',
+
 
                 body:
                   JSON.stringify({
+
                     username:
                       document
-                        .querySelector('#username')
+                        .querySelector(
+                          '#username'
+                        )
                         .value
                         .trim(),
 
+
                     password:
                       document
-                        .querySelector('#password')
+                        .querySelector(
+                          '#password'
+                        )
                         .value,
+
 
                     turnstileToken:
                       token
+
                   })
+
               }
+
             );
 
 
@@ -1849,35 +2681,47 @@ async function adminLogin() {
 
           return adminDashboard();
 
+
         } catch (err) {
+
           message.innerHTML = `
+
             <div class="notice bad">
               ${esc(err.message)}
             </div>
+
           `;
 
 
           token = '';
 
-          btn.disabled = true;
+
+          btn.disabled =
+            true;
 
 
-          resetTurnstile(false);
+          resetTurnstile(
+            false
+          );
+
 
         } finally {
+
           btn.disabled =
             !token;
         }
+
       }
     );
 }
 
 
-/* =========================================================
+/* =====================================================
    ADMIN DASHBOARD
-========================================================= */
+===================================================== */
 
 async function adminDashboard() {
+
   resetTurnstile(true);
 
 
@@ -1889,12 +2733,24 @@ async function adminDashboard() {
 
         <div class="admintop">
 
+
           <div>
 
+
             <span class="badge">
-              ${esc(me?.role || 'admin')}
+
+              ${esc(
+                me?.role ||
+                'admin'
+              )}
+
               ·
-              ${esc(me?.username || '')}
+
+              ${esc(
+                me?.username ||
+                ''
+              )}
+
             </span>
 
 
@@ -1904,15 +2760,21 @@ async function adminDashboard() {
 
 
             <div class="muted">
+
               Create permanent dog IDs,
               print QR codes,
               review sightings
+
               ${
                 me?.role === 'owner'
+
                   ? ' and manage admins'
+
                   : ''
               }.
+
             </div>
+
 
           </div>
 
@@ -1924,6 +2786,7 @@ async function adminDashboard() {
             Logout
           </button>
 
+
         </div>
 
 
@@ -1931,7 +2794,9 @@ async function adminDashboard() {
           class="section admincols"
         >
 
+
           <div class="card">
+
 
             <h2>
               Add street dog
@@ -1942,6 +2807,7 @@ async function adminDashboard() {
               id="addDog"
               class="formgrid"
             >
+
 
               <div class="field">
 
@@ -2067,7 +2933,6 @@ async function adminDashboard() {
                   Description
                 </label>
 
-
                 <textarea
                   id="ddesc"
                   maxlength="500"
@@ -2079,10 +2944,13 @@ async function adminDashboard() {
               <div class="field full">
 
                 <label>
+
                   Photo
+
                   <span class="muted">
                     (optional)
                   </span>
+
                 </label>
 
 
@@ -2094,8 +2962,10 @@ async function adminDashboard() {
 
 
                 <div class="hint">
+
                   Compressed in your browser
                   to WebP before upload.
+
                 </div>
 
               </div>
@@ -2115,12 +2985,15 @@ async function adminDashboard() {
 
               </div>
 
+
             </form>
+
 
           </div>
 
 
           <div class="card">
+
 
             <h2>
               Safety model
@@ -2128,9 +3001,12 @@ async function adminDashboard() {
 
 
             <div class="notice good">
+
               ✓ Permanent QR URL;
+
               dog details can change
               without reprinting.
+
             </div>
 
 
@@ -2138,8 +3014,10 @@ async function adminDashboard() {
               class="notice"
               style="margin-top:9px"
             >
+
               ✓ First public sighting is
               held for admin review.
+
             </div>
 
 
@@ -2147,8 +3025,10 @@ async function adminDashboard() {
               class="notice"
               style="margin-top:9px"
             >
+
               ✓ Suspicious location jumps
               do not overwrite public Last Seen.
+
             </div>
 
 
@@ -2156,17 +3036,22 @@ async function adminDashboard() {
               class="notice"
               style="margin-top:9px"
             >
+
               ✓ Multiple admins use
               separate accounts and
               revocable sessions.
+
             </div>
 
+
           </div>
+
 
         </section>
 
 
         <section class="section">
+
 
           <div class="sectionhead">
 
@@ -2178,8 +3063,10 @@ async function adminDashboard() {
 
 
               <div class="muted">
+
                 Generate/reprint
                 the same QR at any time
+
               </div>
 
             </div>
@@ -2189,7 +3076,9 @@ async function adminDashboard() {
 
           <div class="card tablewrap">
 
+
             <table class="table">
+
 
               <thead>
 
@@ -2213,14 +3102,18 @@ async function adminDashboard() {
 
               </tbody>
 
+
             </table>
 
+
           </div>
+
 
         </section>
 
 
         <section class="section">
+
 
           <div class="sectionhead">
 
@@ -2232,8 +3125,10 @@ async function adminDashboard() {
 
 
               <div class="muted">
+
                 Review held reports
                 before they affect public history
+
               </div>
 
             </div>
@@ -2243,7 +3138,9 @@ async function adminDashboard() {
 
           <div class="card tablewrap">
 
+
             <table class="table">
+
 
               <thead>
 
@@ -2267,17 +3164,23 @@ async function adminDashboard() {
 
               </tbody>
 
+
             </table>
 
+
           </div>
+
 
         </section>
 
 
         ${
           me?.role === 'owner'
+
             ? `
+
                 <section class="section">
+
 
                   <div class="sectionhead">
 
@@ -2299,7 +3202,9 @@ async function adminDashboard() {
 
                   <div class="admincols">
 
+
                     <div class="card">
+
 
                       <h2>
                         Add admin
@@ -2311,12 +3216,12 @@ async function adminDashboard() {
                         class="formgrid"
                       >
 
+
                         <div class="field full">
 
                           <label>
                             Username
                           </label>
-
 
                           <input
                             id="auser"
@@ -2335,7 +3240,6 @@ async function adminDashboard() {
                             Password
                           </label>
 
-
                           <input
                             id="apass"
                             type="password"
@@ -2346,8 +3250,10 @@ async function adminDashboard() {
 
 
                           <div class="hint">
+
                             Use a unique
                             16+ character password.
+
                           </div>
 
                         </div>
@@ -2389,14 +3295,18 @@ async function adminDashboard() {
 
                         </div>
 
+
                       </form>
+
 
                     </div>
 
 
                     <div class="card tablewrap">
 
+
                       <table class="table">
+
 
                         <thead>
 
@@ -2421,34 +3331,49 @@ async function adminDashboard() {
 
                         </tbody>
 
+
                       </table>
+
 
                     </div>
 
+
                   </div>
 
+
                 </section>
+
               `
+
             : ''
         }
 
 
       </div>
+
     </main>
   `);
 
 
   document
-    .querySelector('#logout')
+    .querySelector(
+      '#logout'
+    )
     .addEventListener(
+
       'click',
+
       async () => {
+
         await api(
+
           '/api/admin/logout',
+
           {
-            method: 'POST',
-            body: '{}'
+            method:'POST',
+            body:'{}'
           }
+
         );
 
 
@@ -2461,16 +3386,23 @@ async function adminDashboard() {
 
 
   document
-    .querySelector('#addDog')
+    .querySelector(
+      '#addDog'
+    )
     .addEventListener(
       'submit',
       addDog
     );
 
 
-  if (me?.role === 'owner') {
+  if (
+    me?.role === 'owner'
+  ) {
+
     document
-      .querySelector('#addAdmin')
+      .querySelector(
+        '#addAdmin'
+      )
       .addEventListener(
         'submit',
         addAdmin
@@ -2482,22 +3414,26 @@ async function adminDashboard() {
 }
 
 
-/* =========================================================
-   IMAGE COMPRESSION
-========================================================= */
+/* =====================================================
+   IMAGE
+===================================================== */
 
 async function compressImage(file) {
+
   if (!file) {
     return '';
   }
 
 
   const bitmap =
-    await createImageBitmap(file);
+    await createImageBitmap(
+      file
+    );
 
 
   let w =
     bitmap.width;
+
 
   let h =
     bitmap.height;
@@ -2507,31 +3443,44 @@ async function compressImage(file) {
     720;
 
 
-  if (Math.max(w, h) > max) {
+  if (
+    Math.max(w,h) >
+    max
+  ) {
+
     const ratio =
       max /
-      Math.max(w, h);
+      Math.max(w,h);
 
 
     w =
-      Math.round(w * ratio);
+      Math.round(
+        w * ratio
+      );
 
 
     h =
-      Math.round(h * ratio);
+      Math.round(
+        h * ratio
+      );
   }
 
 
   const canvas =
-    document.createElement('canvas');
+    document.createElement(
+      'canvas'
+    );
 
 
   canvas.width = w;
+
   canvas.height = h;
 
 
   const ctx =
-    canvas.getContext('2d');
+    canvas.getContext(
+      '2d'
+    );
 
 
   ctx.drawImage(
@@ -2560,6 +3509,7 @@ async function compressImage(file) {
     data.length > 200000 &&
     q > .35
   ) {
+
     q -= .08;
 
 
@@ -2571,9 +3521,14 @@ async function compressImage(file) {
   }
 
 
-  if (data.length > 220000) {
+  if (
+    data.length > 220000
+  ) {
+
     throw new Error(
+
       'Photo is still too large after compression. Try a smaller image.'
+
     );
   }
 
@@ -2582,23 +3537,29 @@ async function compressImage(file) {
 }
 
 
-/* =========================================================
+/* =====================================================
    ADD DOG
-========================================================= */
+===================================================== */
 
 async function addDog(e) {
+
   e.preventDefault();
 
 
   const btn =
-    document.querySelector('#addBtn');
+    document.querySelector(
+      '#addBtn'
+    );
 
 
   const msg =
-    document.querySelector('#addMsg');
+    document.querySelector(
+      '#addMsg'
+    );
 
 
-  btn.disabled = true;
+  btn.disabled =
+    true;
 
 
   msg.innerHTML = `
@@ -2609,60 +3570,94 @@ async function addDog(e) {
 
 
   try {
+
     const photoData =
       await compressImage(
+
         document
-          .querySelector('#dphoto')
+          .querySelector(
+            '#dphoto'
+          )
           .files[0]
+
       );
 
 
     const result =
       await api(
+
         '/api/admin/dogs',
+
         {
-          method: 'POST',
+
+          method:'POST',
+
 
           body:
             JSON.stringify({
+
               name:
                 document
-                  .querySelector('#dname')
+                  .querySelector(
+                    '#dname'
+                  )
                   .value,
+
 
               area:
                 document
-                  .querySelector('#darea')
+                  .querySelector(
+                    '#darea'
+                  )
                   .value,
+
 
               sex:
                 document
-                  .querySelector('#dsex')
+                  .querySelector(
+                    '#dsex'
+                  )
                   .value,
+
 
               color:
                 document
-                  .querySelector('#dcolor')
+                  .querySelector(
+                    '#dcolor'
+                  )
                   .value,
+
 
               vaccinationStatus:
                 document
-                  .querySelector('#dvax')
+                  .querySelector(
+                    '#dvax'
+                  )
                   .value,
+
 
               sterilizedStatus:
                 document
-                  .querySelector('#dster')
+                  .querySelector(
+                    '#dster'
+                  )
                   .value,
+
 
               description:
                 document
-                  .querySelector('#ddesc')
+                  .querySelector(
+                    '#ddesc'
+                  )
                   .value,
 
+
               photoData
+
             })
+
         }
+
       );
 
 
@@ -2679,42 +3674,62 @@ async function addDog(e) {
 
 
     msg.innerHTML = `
+
       <div class="notice good">
+
         Dog created.
+
         This QR URL is permanent.
+
       </div>
+
     `;
+
 
   } catch (err) {
+
     msg.innerHTML = `
+
       <div class="notice bad">
+
         ${esc(err.message)}
+
       </div>
+
     `;
 
+
   } finally {
-    btn.disabled = false;
+
+    btn.disabled =
+      false;
   }
 }
 
 
-/* =========================================================
+/* =====================================================
    ADD ADMIN
-========================================================= */
+===================================================== */
 
 async function addAdmin(e) {
+
   e.preventDefault();
 
 
   const btn =
-    document.querySelector('#addAdminBtn');
+    document.querySelector(
+      '#addAdminBtn'
+    );
 
 
   const msg =
-    document.querySelector('#addAdminMsg');
+    document.querySelector(
+      '#addAdminMsg'
+    );
 
 
-  btn.disabled = true;
+  btn.disabled =
+    true;
 
 
   msg.innerHTML = `
@@ -2725,29 +3740,46 @@ async function addAdmin(e) {
 
 
   try {
+
     await api(
+
       '/api/admin/admins',
+
       {
-        method: 'POST',
+
+        method:'POST',
+
 
         body:
           JSON.stringify({
+
             username:
               document
-                .querySelector('#auser')
+                .querySelector(
+                  '#auser'
+                )
                 .value,
+
 
             password:
               document
-                .querySelector('#apass')
+                .querySelector(
+                  '#apass'
+                )
                 .value,
+
 
             role:
               document
-                .querySelector('#arole')
+                .querySelector(
+                  '#arole'
+                )
                 .value
+
           })
+
       }
+
     );
 
 
@@ -2763,64 +3795,89 @@ async function addAdmin(e) {
 
     await refreshAdmins();
 
+
   } catch (err) {
+
     msg.innerHTML = `
       <div class="notice bad">
         ${esc(err.message)}
       </div>
     `;
 
+
   } finally {
-    btn.disabled = false;
+
+    btn.disabled =
+      false;
   }
 }
 
 
-/* =========================================================
-   ADMIN DOGS + SIGHTINGS
-========================================================= */
+/* =====================================================
+   ADMIN DATA
+===================================================== */
 
 async function refreshAdmin() {
+
   try {
+
     const [
       { dogs },
       { sightings }
     ] =
+
       await Promise.all([
-        api('/api/admin/dogs'),
-        api('/api/admin/sightings')
+
+        api(
+          '/api/admin/dogs'
+        ),
+
+        api(
+          '/api/admin/sightings'
+        )
+
       ]);
 
 
     document
-      .querySelector('#adminDogs')
+      .querySelector(
+        '#adminDogs'
+      )
       .innerHTML =
 
         dogs.length
 
           ? dogs.map(
               d => `
+
                 <tr>
 
+
                   <td>
+
                     <strong>
                       ${esc(d.name)}
                     </strong>
+
                   </td>
 
 
                   <td>
+
                     ${esc(
                       d.area ||
                       '—'
                     )}
+
                   </td>
 
 
                   <td>
+
                     <code>
                       ${esc(d.id)}
                     </code>
+
                   </td>
 
 
@@ -2836,43 +3893,61 @@ async function refreshAdmin() {
 
                   </td>
 
+
                 </tr>
+
               `
             ).join('')
 
+
           : `
+
               <tr>
+
                 <td colspan="4">
                   No dogs yet.
                 </td>
+
               </tr>
+
             `;
 
 
     document
-      .querySelectorAll('.qrbtn')
+      .querySelectorAll(
+        '.qrbtn'
+      )
       .forEach(
+
         b =>
           b.addEventListener(
+
             'click',
+
             () =>
               showQr(
                 b.dataset.id,
                 b.dataset.name
               )
+
           )
+
       );
 
 
     document
-      .querySelector('#adminSightings')
+      .querySelector(
+        '#adminSightings'
+      )
       .innerHTML =
 
         sightings.length
 
           ? sightings.map(
               s => `
+
                 <tr>
+
 
                   <td>
 
@@ -2883,9 +3958,13 @@ async function refreshAdmin() {
                     <br>
 
                     <span class="muted">
+
                       ${esc(
-                        fmtTime(s.created_at)
+                        fmtTime(
+                          s.created_at
+                        )
                       )}
+
                     </span>
 
                   </td>
@@ -2894,37 +3973,45 @@ async function refreshAdmin() {
                   <td>
 
                     ${esc(
-                      nice(s.condition)
+                      nice(
+                        s.condition
+                      )
                     )}
 
                     <br>
 
                     <span class="muted">
+
                       GPS ±${Math.round(
-                        Number(s.accuracy_m) || 0
+                        Number(
+                          s.accuracy_m
+                        ) || 0
                       )}m
+
                     </span>
 
 
                     ${
                       s.note
+
                         ? `
                             <br>
                             📝 ${esc(s.note)}
                           `
+
                         : ''
                     }
 
 
                     <div style="margin-top:8px">
 
-                      ${navigationButton(
+                      ${navigationButtons(
                         s.latitude,
-                        s.longitude,
-                        '🧭 Navigate'
+                        s.longitude
                       )}
 
                     </div>
+
 
                   </td>
 
@@ -2945,7 +4032,9 @@ async function refreshAdmin() {
 
                     </span>
 
+
                     <br>
+
 
                     <span class="muted">
 
@@ -2966,6 +4055,7 @@ async function refreshAdmin() {
                       'review'
 
                         ? `
+
                             <button
                               class="btn secondary mod"
                               data-id="${esc(s.id)}"
@@ -2974,6 +4064,7 @@ async function refreshAdmin() {
                               Accept
                             </button>
 
+
                             <button
                               class="btn danger mod"
                               data-id="${esc(s.id)}"
@@ -2981,6 +4072,7 @@ async function refreshAdmin() {
                             >
                               Reject
                             </button>
+
                           `
 
                         : '—'
@@ -2988,80 +4080,122 @@ async function refreshAdmin() {
 
                   </td>
 
+
                 </tr>
+
               `
             ).join('')
 
+
           : `
+
               <tr>
+
                 <td colspan="4">
                   No sightings yet.
                 </td>
+
               </tr>
+
             `;
 
 
     document
-      .querySelectorAll('.mod')
+      .querySelectorAll(
+        '.mod'
+      )
       .forEach(
+
         b =>
           b.addEventListener(
+
             'click',
+
             async () => {
-              b.disabled = true;
+
+
+              b.disabled =
+                true;
 
 
               try {
+
                 await api(
+
                   `/api/admin/sighting/${encodeURIComponent(
                     b.dataset.id
                   )}`,
+
                   {
-                    method: 'PATCH',
+
+                    method:'PATCH',
+
 
                     body:
                       JSON.stringify({
+
                         status:
                           b.dataset.status,
+
 
                         confidence:
                           b.dataset.status ===
                           'accepted'
+
                             ? 'medium'
+
                             : 'low'
+
                       })
+
                   }
+
                 );
 
 
                 await refreshAdmin();
 
+
               } catch (e) {
+
                 alert(
                   e.message
                 );
 
 
-                b.disabled = false;
+                b.disabled =
+                  false;
               }
+
             }
+
           )
+
       );
 
 
-    if (me?.role === 'owner') {
+    if (
+      me?.role === 'owner'
+    ) {
+
       await refreshAdmins();
     }
 
+
   } catch (e) {
+
     if (
       e.message ===
       'Unauthorized'
     ) {
+
       me = null;
 
+
       adminLogin();
+
     } else {
+
       alert(
         e.message
       );
@@ -3070,12 +4204,15 @@ async function refreshAdmin() {
 }
 
 
-/* =========================================================
-   ADMIN MANAGEMENT
-========================================================= */
+/* =====================================================
+   ADMINS
+===================================================== */
 
 async function refreshAdmins() {
-  if (me?.role !== 'owner') {
+
+  if (
+    me?.role !== 'owner'
+  ) {
     return;
   }
 
@@ -3084,6 +4221,7 @@ async function refreshAdmins() {
     admins,
     currentAdminId
   } =
+
     await api(
       '/api/admin/admins'
     );
@@ -3101,11 +4239,14 @@ async function refreshAdmins() {
 
 
   box.innerHTML =
+
     admins.length
 
       ? admins.map(
           a => `
+
             <tr>
+
 
               <td>
 
@@ -3115,14 +4256,19 @@ async function refreshAdmins() {
 
 
                 ${
-                  a.id === currentAdminId
+                  a.id ===
+                  currentAdminId
+
                     ? `
+
                         <br>
 
                         <span class="muted">
                           You
                         </span>
+
                       `
+
                     : ''
                 }
 
@@ -3137,18 +4283,24 @@ async function refreshAdmins() {
               <td>
 
                 ${
-                  Number(a.active) === 1
+                  Number(
+                    a.active
+                  ) === 1
 
                     ? `
+
                         <span class="confidence high">
                           ACTIVE
                         </span>
+
                       `
 
                     : `
+
                         <span class="confidence low">
                           DISABLED
                         </span>
+
                       `
                 }
 
@@ -3156,60 +4308,88 @@ async function refreshAdmins() {
 
 
               <td>
+
                 ${
                   a.last_login_at
+
                     ? esc(
                         fmtTime(
                           a.last_login_at
                         )
                       )
+
                     : 'Never'
                 }
+
               </td>
 
 
               <td>
 
                 ${
-                  a.id === currentAdminId
+                  a.id ===
+                  currentAdminId
 
                     ? '—'
 
                     : `
+
                         <button
                           class="btn ${
-                            Number(a.active) === 1
+                            Number(
+                              a.active
+                            ) === 1
+
                               ? 'danger'
+
                               : 'secondary'
                           } admin-toggle"
                           data-id="${esc(a.id)}"
                           data-active="${
-                            Number(a.active) === 1
+                            Number(
+                              a.active
+                            ) === 1
+
                               ? '0'
+
                               : '1'
                           }"
                         >
+
                           ${
-                            Number(a.active) === 1
+                            Number(
+                              a.active
+                            ) === 1
+
                               ? 'Disable'
+
                               : 'Enable'
                           }
+
                         </button>
+
                       `
                 }
 
               </td>
 
+
             </tr>
+
           `
         ).join('')
 
+
       : `
+
           <tr>
+
             <td colspan="5">
               No admins.
             </td>
+
           </tr>
+
         `;
 
 
@@ -3218,141 +4398,194 @@ async function refreshAdmins() {
       '.admin-toggle'
     )
     .forEach(
+
       b =>
         b.addEventListener(
+
           'click',
+
           async () => {
-            b.disabled = true;
+
+
+            b.disabled =
+              true;
 
 
             try {
+
               await api(
+
                 `/api/admin/admin/${encodeURIComponent(
                   b.dataset.id
                 )}`,
+
                 {
-                  method: 'PATCH',
+
+                  method:'PATCH',
+
 
                   body:
                     JSON.stringify({
+
                       active:
                         b.dataset.active ===
                         '1'
+
                     })
+
                 }
+
               );
 
 
               await refreshAdmins();
 
+
             } catch (e) {
+
               alert(
                 e.message
               );
 
 
-              b.disabled = false;
+              b.disabled =
+                false;
             }
+
           }
+
         )
+
     );
 }
 
 
-/* =========================================================
+/* =====================================================
    QR
-========================================================= */
+===================================================== */
 
 async function showQr(
   id,
   name
 ) {
+
   const url =
-    `${location.origin}/dog/${encodeURIComponent(id)}`;
+
+    `${location.origin}/dog/${encodeURIComponent(
+      id
+    )}`;
 
 
-  const m = modal(`
-    <div class="modalhead">
+  const m =
+    modal(`
 
-      <div>
-
-        <h2>
-          Permanent QR
-        </h2>
+      <div class="modalhead">
 
 
-        <div class="muted">
-          ${esc(name)}
+        <div>
+
+
+          <h2>
+            Permanent QR
+          </h2>
+
+
+          <div class="muted">
+            ${esc(name)}
+          </div>
+
+
         </div>
 
-      </div>
-
-
-      <button
-        class="iconbtn"
-        data-close
-        aria-label="Close"
-      >
-        ×
-      </button>
-
-    </div>
-
-
-    <div class="qrcard">
-
-      <canvas id="qr"></canvas>
-
-
-      <p>
-        <code>
-          ${esc(url)}
-        </code>
-      </p>
-
-
-      <div class="notice good">
-        Dog details and location history
-        can change;
-        this QR URL does not.
-      </div>
-
-
-      <div style="margin-top:13px">
 
         <button
-          class="btn"
-          id="downloadQr"
+          class="iconbtn"
+          data-close
+          aria-label="Close"
         >
-          Download QR PNG
+          ×
         </button>
+
 
       </div>
 
-    </div>
-  `);
+
+      <div class="qrcard">
+
+
+        <canvas id="qr"></canvas>
+
+
+        <p>
+
+          <code>
+            ${esc(url)}
+          </code>
+
+        </p>
+
+
+        <div class="notice good">
+
+          Dog details and location history
+          can change;
+
+          this QR URL does not.
+
+        </div>
+
+
+        <div style="margin-top:13px">
+
+          <button
+            class="btn"
+            id="downloadQr"
+          >
+            Download QR PNG
+          </button>
+
+        </div>
+
+
+      </div>
+    `);
 
 
   const canvas =
-    m.back.querySelector('#qr');
+    m.back.querySelector(
+      '#qr'
+    );
 
 
   await QRCode.toCanvas(
+
     canvas,
+
     url,
+
     {
-      width: 360,
-      margin: 2,
-      errorCorrectionLevel: 'H'
+
+      width:360,
+
+      margin:2,
+
+      errorCorrectionLevel:'H'
     }
+
   );
 
 
   m.back
-    .querySelector('#downloadQr')
+    .querySelector(
+      '#downloadQr'
+    )
     .addEventListener(
+
       'click',
+
       () => {
+
+
         const a =
           document.createElement(
             'a'
@@ -3360,6 +4593,7 @@ async function showQr(
 
 
         a.download =
+
           `${name.replace(
             /[^a-z0-9_-]+/gi,
             '-'
@@ -3377,16 +4611,19 @@ async function showQr(
 
         a.click();
       }
+
     );
 }
 
 
-/* =========================================================
+/* =====================================================
    ROUTER
-========================================================= */
+===================================================== */
 
 async function route() {
+
   clearMap();
+
   resetTurnstile(true);
 
 
@@ -3394,12 +4631,16 @@ async function route() {
     location.pathname;
 
 
-  if (path === '/') {
+  if (
+    path === '/'
+  ) {
     return home();
   }
 
 
-  if (path === '/admin') {
+  if (
+    path === '/admin'
+  ) {
     return admin();
   }
 
@@ -3411,10 +4652,13 @@ async function route() {
 
 
   if (match) {
+
     return dogPage(
+
       decodeURIComponent(
         match[1]
       )
+
     );
   }
 
@@ -3425,6 +4669,7 @@ async function route() {
       <div class="wrap section">
 
         <div class="card empty">
+
 
           <h2>
             Page not found
@@ -3439,6 +4684,7 @@ async function route() {
             Go home
           </a>
 
+
         </div>
 
       </div>
@@ -3448,9 +4694,9 @@ async function route() {
 }
 
 
-/* =========================================================
+/* =====================================================
    START
-========================================================= */
+===================================================== */
 
 window.addEventListener(
   'popstate',
@@ -3459,13 +4705,17 @@ window.addEventListener(
 
 
 (async () => {
+
   try {
+
     config =
       await api(
         '/api/config'
       );
+
   } catch {}
 
 
   route();
+
 })();
