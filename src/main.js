@@ -122,41 +122,22 @@ function googleMapsAppUrl(lat, lng) {
 
 
 function navigationButtons(lat, lng) {
-  const normalUrl = mapsDirectionsUrl(lat, lng);
-  const appUrl = googleMapsAppUrl(lat, lng);
+  const appUrl =
+    googleMapsAppUrl(lat, lng);
 
-  if (!normalUrl) return '';
+  if (!appUrl) {
+    return '';
+  }
 
   return `
-    <div
-      style="
-        display:flex;
-        gap:8px;
-        flex-wrap:wrap;
-        align-items:center;
-      "
+    <a
+      class="btn"
+      href="${esc(appUrl)}"
     >
-
-      <a
-        class="btn secondary"
-        href="${esc(normalUrl)}"
-        target="_blank"
-        rel="noopener noreferrer"
-      >
-        🗺️ Check on Google Maps
-      </a>
-
-      <a
-        class="btn"
-        href="${esc(appUrl)}"
-      >
-        ▶️ Start Navigation
-      </a>
-
-    </div>
+      ▶️ Start Navigation
+    </a>
   `;
 }
-
 
 /*
   BEST AVAILABLE GPS
@@ -3120,7 +3101,7 @@ async function adminDashboard() {
             <div>
 
               <h2>
-                Sighting moderation
+                Sighting records
               </h2>
 
 

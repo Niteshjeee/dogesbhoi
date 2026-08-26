@@ -36,7 +36,7 @@ export async function onRequestPost({ request, env }) {
     !dogId ||
     !Number.isFinite(latitude) || latitude < -90 || latitude > 90 ||
     !Number.isFinite(longitude) || longitude < -180 || longitude > 180 ||
-    !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 2000
+    !Number.isFinite(accuracy) || accuracy < 0 || accuracy > 50
   ) {
     return badRequest('Invalid location');
   }
