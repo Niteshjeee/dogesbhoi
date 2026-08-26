@@ -1,20 +1,22 @@
 {
   "name": "doges-street-dog-safety",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "make-admin-hash": "node scripts/make-admin-hash.mjs"
+    "make-secrets": "node scripts/make-secrets.mjs",
+    "make-first-admin": "node scripts/make-first-admin-sql.mjs",
+    "verify-admin-hash": "node scripts/verify-admin-hash.mjs"
   },
   "dependencies": {
     "leaflet": "^1.9.4",
     "qrcode": "^1.5.4"
   },
   "devDependencies": {
-    "vite": "^7.1.3",
+    "vite": "^7.3.6",
     "wrangler": "^4.33.1"
   }
 }

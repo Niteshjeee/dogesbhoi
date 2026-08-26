@@ -2,488 +2,136 @@ import {
   badRequest,
   forbidden,
   json,
+  normalizeUsername,
   readJson,
   sameOrigin,
-  unauthorized
+  unauthorized,
+  validUsername
 } from '../../../server/http.js';
+import { verifyTurnstile } from '../../../server/turnstile.js';
+import { hashReporter } from '../../../server/crypto.js';
+import { DUMMY_PASSWORD_HASH, verifyPassword } from '../../../server/passwords.js';
+import { makeSession, sessionCookie } from '../../../server/session.js';
 
-import {
-  verifyPassword,
-  makeSession,
-  sessionCookie
-} from '../../../server/auth.js';
-
-import {
-  verifyTurnstile
-} from '../../../server/turnstile.js';
-
-import {
-  hashReporter
-} from '../../../server/crypto.js';
-
-
-/*
-  TEMPORARY TEST HASH
-
-  Password:
-  DogesDemo@2026!
-
-  Diagnosis complete hone ke baad
-  is constant + debug logging ko remove kar denge.
-*/
-const DEMO_HASH =
-  'pbkdf2$310000$ZGVtby1kb2dlcy1zYWx0LTIwMjY$gudqtQkTJr9kNNkAqyprsvAE28Frl9SmDUVsqdKg_F8';
-
-
-export async function onRequestPost({
-  request,
-  env
-}) {
-
-  /*
-    ---------------------------------------------------------
-    1. SAME-ORIGIN PROTECTION
-    ---------------------------------------------------------
-  */
-
-  if (!sameOrigin(request)) {
-    return forbidden();
-  }
-
-
-  /*
-    ---------------------------------------------------------
-    2. REQUIRED SECURITY CONFIG
-    ---------------------------------------------------------
-  */
+export async function onRequestPost({ request, env }) {
+  if (!sameOrigin(request)) return forbidden();
 
   if (
+    !env.DB ||
     !env.SESSION_SECRET ||
-    !env.ADMIN_PASSWORD_HASH ||
-    !env.IP_HASH_SECRET
+    !env.IP_HASH_SECRET ||
+    !env.TURNSTILE_SECRET_KEY ||
+    !env.TURNSTILE_HOSTNAMES
   ) {
-
-    return json(
-      {
-        error:
-          'Admin security is not configured'
-      },
-      503
-    );
-
+    return json({ error: 'Admin security is not configured' }, 503);
   }
-
-
-  /*
-    ---------------------------------------------------------
-    3. READ REQUEST BODY
-    ---------------------------------------------------------
-  */
 
   let body;
-
   try {
-
-    body =
-      await readJson(
-        request,
-        12_000
-      );
-
+    body = await readJson(request, 12_000);
+  } catch {
+    return badRequest('Invalid request');
   }
 
-  catch {
-
-    return badRequest(
-      'Invalid request'
-    );
-
-  }
-
-
-  /*
-    ---------------------------------------------------------
-    4. TURNSTILE
-    ---------------------------------------------------------
-  */
-
-  const ip =
-    request.headers.get(
-      'CF-Connecting-IP'
-    ) || '';
-
-
-  const humanOk =
-    await verifyTurnstile(
-
-      env.TURNSTILE_SECRET_KEY,
-
-      body.turnstileToken,
-
-      ip,
-
-      'admin_login'
-    );
-
-
-  if (!humanOk) {
-
-    return badRequest(
-      'Human verification failed'
-    );
-
-  }
-
-
-  /*
-    ---------------------------------------------------------
-    5. PRIVACY-PRESERVING REPORTER HASH
-    ---------------------------------------------------------
-  */
-
-  const reporterHash =
-    await hashReporter(
-
-      env.IP_HASH_SECRET,
-
-      ip,
-
-      request.headers.get(
-        'user-agent'
-      ) || ''
-
-    );
-
-
-  /*
-    ---------------------------------------------------------
-    6. CLEAR OLD LOGIN ATTEMPTS
-    ---------------------------------------------------------
-  */
-
-  await env.DB
-    .prepare(
-      `
-      DELETE FROM admin_login_attempts
-      WHERE created_at < ?
-      `
-    )
-    .bind(
-      Date.now() -
-      24 * 60 * 60_000
-    )
-    .run();
-
-
-  /*
-    ---------------------------------------------------------
-    7. BRUTE-FORCE LIMIT
-    ---------------------------------------------------------
-  */
-
-  const since =
-    Date.now() -
-    15 * 60_000;
-
-
-  const count =
-    await env.DB
-      .prepare(
-        `
-        SELECT COUNT(*) AS c
-        FROM admin_login_attempts
-        WHERE reporter_hash = ?
-        AND created_at > ?
-        `
-      )
-      .bind(
-        reporterHash,
-        since
-      )
-      .first();
-
-
-  if (
-    Number(
-      count?.c || 0
-    ) >= 8
-  ) {
-
-    return json(
-      {
-        error:
-          'Too many login attempts. Try again later.'
-      },
-      429
-    );
-
-  }
-
-
-  /*
-    ---------------------------------------------------------
-    8. NORMALIZE LOGIN VALUES
-    ---------------------------------------------------------
-  */
-
-  const expectedUsername =
-    String(
-      env.ADMIN_USERNAME ||
-      'admin'
-    );
-
-
-  const submittedUsername =
-    String(
-      body.username ||
-      ''
-    );
-
-
-  const submittedPassword =
-    String(
-      body.password ||
-      ''
-    );
-
-
-  const storedHash =
-    String(
-      env.ADMIN_PASSWORD_HASH ||
-      ''
-    );
-
-
-  /*
-    ---------------------------------------------------------
-    9. REAL LOGIN CHECK
-    ---------------------------------------------------------
-  */
-
-  const validUser =
-    submittedUsername ===
-    expectedUsername;
-
-
-  const validPass =
-    await verifyPassword(
-      submittedPassword,
-      storedHash
-    );
-
-
-  /*
-    ---------------------------------------------------------
-    10. TEMPORARY DIAGNOSTIC CHECKS
-
-    No real password/hash/secret is printed.
-    ---------------------------------------------------------
-  */
-
-  const hashParts =
-    storedHash.split('$');
-
-
-  /*
-    Does Cloudflare ENV contain
-    EXACTLY our known demo hash?
-  */
-  const envHashIsExactDemo =
-    storedHash === DEMO_HASH;
-
-
-  /*
-    Does known demo password work
-    against whatever ENV hash
-    Cloudflare currently supplied?
-  */
-  const demoPasswordWorksWithEnvHash =
-    await verifyPassword(
-      'DogesDemo@2026!',
-      storedHash
-    );
-
-
-  /*
-    Does password received from browser
-    work against our hard-coded,
-    known-good demo hash?
-  */
-  const submittedPasswordWorksWithKnownDemo =
-    await verifyPassword(
-      submittedPassword,
-      DEMO_HASH
-    );
-
-
-  /*
-    ---------------------------------------------------------
-    SAFE DEBUG OUTPUT
-
-    IMPORTANT:
-    We are NOT logging:
-    - password
-    - full password hash
-    - salt
-    - digest
-    - session secret
-    - IP secret
-    ---------------------------------------------------------
-  */
-
-  console.log(
-    'ADMIN_LOGIN_DEBUG',
-    JSON.stringify({
-
-      expectedUsername,
-
-      submittedUsername,
-
-      usernameMatch:
-        validUser,
-
-      passwordLength:
-        submittedPassword.length,
-
-      passwordMatch:
-        validPass,
-
-      hashPresent:
-        storedHash.length > 0,
-
-      hashLength:
-        storedHash.length,
-
-      hashStartsCorrectly:
-        storedHash.startsWith(
-          'pbkdf2$'
-        ),
-
-      hashParts:
-        hashParts.length,
-
-      hashKind:
-        hashParts[0] || '',
-
-      iterations:
-        hashParts[1] || '',
-
-      saltCharacters:
-        hashParts[2]?.length || 0,
-
-      digestCharacters:
-        hashParts[3]?.length || 0,
-
-      leadingOrTrailingWhitespace:
-        storedHash !==
-        storedHash.trim(),
-
-      containsWhitespace:
-        /\s/.test(
-          storedHash
-        ),
-
-      /*
-        THESE THREE ARE THE
-        IMPORTANT NEW VALUES
-      */
-
-      envHashIsExactDemo,
-
-      demoPasswordWorksWithEnvHash,
-
-      submittedPasswordWorksWithKnownDemo
-
-    })
+  const username = normalizeUsername(body.username);
+  const password = String(body.password || '');
+  const ip = request.headers.get('CF-Connecting-IP') || '';
+
+  const human = await verifyTurnstile(
+    env,
+    body.turnstileToken,
+    ip,
+    'admin_login'
+  );
+  if (!human) return badRequest('Human verification failed');
+
+  const reporterHash = await hashReporter(
+    env.IP_HASH_SECRET,
+    ip,
+    request.headers.get('user-agent') || ''
   );
 
+  const now = Date.now();
+  await env.DB.prepare(
+    'DELETE FROM admin_auth_attempts WHERE created_at<?'
+  ).bind(now - 24 * 60 * 60_000).run();
 
-  /*
-    ---------------------------------------------------------
-    11. FAILED LOGIN
-    ---------------------------------------------------------
-  */
+  const reporterCount = await env.DB.prepare(`
+    SELECT COUNT(*) c
+    FROM admin_auth_attempts
+    WHERE reporter_hash=? AND created_at>?
+  `).bind(reporterHash, now - 15 * 60_000).first();
+
+  const userCount = await env.DB.prepare(`
+    SELECT COUNT(*) c
+    FROM admin_auth_attempts
+    WHERE username_key=? AND created_at>?
+  `).bind(username.slice(0, 32), now - 60 * 60_000).first();
 
   if (
-    !validUser ||
-    !validPass
+    Number(reporterCount?.c || 0) >= 8 ||
+    Number(userCount?.c || 0) >= 20
   ) {
-
-    await env.DB
-      .prepare(
-        `
-        INSERT INTO
-        admin_login_attempts(
-          reporter_hash,
-          created_at
-        )
-        VALUES (?, ?)
-        `
-      )
-      .bind(
-        reporterHash,
-        Date.now()
-      )
-      .run();
-
-
-    return unauthorized(
-      'Invalid login'
+    return json(
+      { error: 'Too many login attempts. Try again later.' },
+      429
     );
-
   }
 
+  let admin = null;
+  if (validUsername(username)) {
+    admin = await env.DB.prepare(`
+      SELECT id,username,password_hash,role,active,session_version
+      FROM admins
+      WHERE username=?
+      LIMIT 1
+    `).bind(username).first();
+  }
 
-  /*
-    ---------------------------------------------------------
-    12. SUCCESS
+  const passwordOk = await verifyPassword(
+    password,
+    admin?.password_hash || DUMMY_PASSWORD_HASH
+  );
 
-    Delete failed attempts.
-    ---------------------------------------------------------
-  */
+  const valid =
+    Boolean(admin) &&
+    Number(admin.active) === 1 &&
+    passwordOk;
 
-  await env.DB
-    .prepare(
-      `
-      DELETE FROM admin_login_attempts
-      WHERE reporter_hash = ?
-      `
-    )
-    .bind(
-      reporterHash
-    )
-    .run();
+  if (!valid) {
+    await env.DB.prepare(`
+      INSERT INTO admin_auth_attempts(
+        reporter_hash,username_key,created_at
+      )
+      VALUES(?,?,?)
+    `).bind(reporterHash, username.slice(0, 32), now).run();
 
+    return unauthorized('Invalid login');
+  }
 
-  /*
-    ---------------------------------------------------------
-    13. CREATE SECURE SESSION
-    ---------------------------------------------------------
-  */
+  await env.DB.prepare(`
+    DELETE FROM admin_auth_attempts
+    WHERE reporter_hash=? OR username_key=?
+  `).bind(reporterHash, username).run();
 
-  const token =
-    await makeSession(
-      env.SESSION_SECRET
-    );
+  await env.DB.prepare(`
+    UPDATE admins
+    SET last_login_at=?,updated_at=?
+    WHERE id=?
+  `).bind(now, now, admin.id).run();
 
-
-  /*
-    ---------------------------------------------------------
-    14. SEND HTTPONLY SESSION COOKIE
-    ---------------------------------------------------------
-  */
+  const token = await makeSession(env.SESSION_SECRET, admin);
 
   return json(
     {
-      ok: true
+      ok: true,
+      admin: {
+        id: admin.id,
+        username: admin.username,
+        role: admin.role
+      }
     },
     200,
-    {
-      'set-cookie':
-        sessionCookie(
-          token
-        )
-    }
+    { 'set-cookie': sessionCookie(token) }
   );
-
 }

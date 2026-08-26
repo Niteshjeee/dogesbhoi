@@ -34,9 +34,3 @@ CREATE TABLE IF NOT EXISTS sightings (
 CREATE INDEX IF NOT EXISTS idx_sightings_dog_time ON sightings(dog_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sightings_status_time ON sightings(moderation_status, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_sightings_reporter_time ON sightings(reporter_hash, created_at DESC);
-
-CREATE TABLE IF NOT EXISTS admin_login_attempts (
-  reporter_hash TEXT NOT NULL,
-  created_at INTEGER NOT NULL
-);
-CREATE INDEX IF NOT EXISTS idx_login_attempts_hash_time ON admin_login_attempts(reporter_hash, created_at DESC);

@@ -9,7 +9,7 @@ export function json(data, status = 200, headers = {}) {
   });
 }
 
-export function badRequest(message) { return json({ error: message }, 400); }
+export function badRequest(message = 'Bad request') { return json({ error: message }, 400); }
 export function unauthorized(message = 'Unauthorized') { return json({ error: message }, 401); }
 export function forbidden(message = 'Forbidden') { return json({ error: message }, 403); }
 export function notFound(message = 'Not found') { return json({ error: message }, 404); }
@@ -23,11 +23,24 @@ export async function readJson(request, maxBytes = 400_000) {
 }
 
 export function sameOrigin(request) {
+  const target = new URL(request.url).origin;
   const origin = request.headers.get('origin');
-  if (!origin) return true;
-  return origin === new URL(request.url).origin;
+  if (origin) return origin === target;
+  const site = request.headers.get('sec-fetch-site');
+  return !site || site === 'same-origin' || site === 'same-site';
 }
 
 export function cleanText(value, max = 250) {
-  return String(value ?? '').replace(/[\u0000-\u001F\u007F]/g, ' ').trim().slice(0, max);
+  return String(value ?? '')
+    .replace(/[\u0000-\u001F\u007F]/g, ' ')
+    .trim()
+    .slice(0, max);
+}
+
+export function normalizeUsername(value) {
+  return String(value ?? '').trim().toLowerCase();
+}
+
+export function validUsername(value) {
+  return /^[a-z0-9._-]{3,32}$/.test(normalizeUsername(value));
 }

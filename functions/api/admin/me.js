@@ -1,6 +1,16 @@
 import { json, unauthorized } from '../../../server/http.js';
-import { verifySession } from '../../../server/auth.js';
+import { getAdmin } from '../../../server/authz.js';
+
 export async function onRequestGet({ request, env }) {
-  if (!await verifySession(request, env.SESSION_SECRET)) return unauthorized();
-  return json({ authenticated: true, username: env.ADMIN_USERNAME || 'admin' });
+  const admin = await getAdmin(request, env);
+  if (!admin) return unauthorized();
+
+  return json({
+    authenticated: true,
+    admin: {
+      id: admin.id,
+      username: admin.username,
+      role: admin.role
+    }
+  });
 }
