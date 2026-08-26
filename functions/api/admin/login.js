@@ -16,14 +16,17 @@ import { makeSession, sessionCookie } from '../../../server/session.js';
 export async function onRequestPost({ request, env }) {
   if (!sameOrigin(request)) return forbidden();
 
-  if (
-    !env.DB ||
-    !env.SESSION_SECRET ||
-    !env.IP_HASH_SECRET ||
-    !env.TURNSTILE_SECRET_KEY ||
-    !env.TURNSTILE_HOSTNAMES
-  ) {
-    return json({ error: 'Admin security is not configured' }, 503);
+  const missingSecurity = [
+    !env.DB && 'DB',
+    !env.SESSION_SECRET && 'SESSION_SECRET',
+    !env.IP_HASH_SECRET && 'IP_HASH_SECRET',
+    !env.TURNSTILE_SECRET_KEY && 'TURNSTILE_SECRET_KEY'
+  ].filter(Boolean);
+
+  if (missingSecurity.length) {
+    return json({
+      error: `Admin security is not configured: missing ${missingSecurity.join(', ')}`
+    }, 503);
   }
 
   let body;
@@ -38,6 +41,7 @@ export async function onRequestPost({ request, env }) {
   const ip = request.headers.get('CF-Connecting-IP') || '';
 
   const human = await verifyTurnstile(
+    request,
     env,
     body.turnstileToken,
     ip,

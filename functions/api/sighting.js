@@ -42,7 +42,18 @@ export async function onRequestPost({ request, env }) {
   }
 
   const ip = request.headers.get('CF-Connecting-IP') || '';
-  const human = await verifyTurnstile(env, body.turnstileToken, ip, 'sighting');
+  const missingSecurity = [
+    !env.DB && 'DB',
+    !env.IP_HASH_SECRET && 'IP_HASH_SECRET',
+    !env.TURNSTILE_SECRET_KEY && 'TURNSTILE_SECRET_KEY'
+  ].filter(Boolean);
+  if (missingSecurity.length) {
+    return json({
+      error: `Server security is not configured: missing ${missingSecurity.join(', ')}`
+    }, 503);
+  }
+
+  const human = await verifyTurnstile(request, env, body.turnstileToken, ip, 'sighting');
   if (!human) return badRequest('Human verification failed');
 
   const dog = await env.DB.prepare(
@@ -50,9 +61,6 @@ export async function onRequestPost({ request, env }) {
   ).bind(dogId).first();
 
   if (!dog) return badRequest('Unknown dog');
-  if (!env.IP_HASH_SECRET) {
-    return json({ error: 'Server security is not configured' }, 503);
-  }
 
   const reporterHash = await hashReporter(
     env.IP_HASH_SECRET,
